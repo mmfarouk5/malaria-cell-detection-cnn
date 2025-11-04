@@ -24,9 +24,9 @@ train_data = datasets.ImageFolder(root=train_dir, transform=train_transforms)
 val_data = datasets.ImageFolder(root=val_dir, transform=val_test_transforms)
 test_data = datasets.ImageFolder(root=test_dir, transform=val_test_transforms)
 
-train_loader = DataLoader(train_data, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
-val_loader = DataLoader(val_data, batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
-test_loader = DataLoader(test_data, batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
+train_loader = DataLoader(train_data, batch_size=BATCH_SIZE, shuffle=True)
+val_loader = DataLoader(val_data, batch_size=BATCH_SIZE, shuffle=False)
+test_loader = DataLoader(test_data, batch_size=BATCH_SIZE, shuffle=False)
 
 if __name__ == "__main__":
     print(f"Train images: {len(train_data)}")
