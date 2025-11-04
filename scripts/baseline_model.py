@@ -8,7 +8,7 @@ from data import train_loader, val_loader
 
 class BaselineCNN(nn.Module):
     def __init__(self):
-        super(BaselineCNN, self).__init__()
+        super().__init__()
         self.features = nn.Sequential(
             nn.Conv2d(3, 32, kernel_size=3, padding=1),
             nn.ReLU(),
