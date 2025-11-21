@@ -42,7 +42,7 @@ def build_resnet50(num_classes=1, freeze_backbone=False):
     return model
 
 
-def train_one_epoch(model, loader, criterion, optimizer):
+def train_one_epoch(model, loader, criterion, optimizer, max_norm):
     model.train()
     total_loss = 0
     correct = 0
@@ -59,7 +59,7 @@ def train_one_epoch(model, loader, criterion, optimizer):
             loss = criterion(outputs, labels)
             loss.backward()
 
-            clip_grad_norm_(model.parameters(), max_norm=1.0)
+            clip_grad_norm_(model.parameters(), max_norm=max_norm)
 
             optimizer.step()
 
@@ -128,11 +128,12 @@ def main():
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
     epochs = cfg["training"]["epochs"]
+    max_norm = cfg["training"]["max_norm"]
     best_val_loss = float('inf')
     logger.info(f"Starting training for {epochs} epochs...")
 
     for epoch in range(1, epochs + 1):
-        train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer)
+        train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, max_norm=max_norm)
         val_loss, val_acc = validate(model, val_loader, criterion)
 
         logger.info(
