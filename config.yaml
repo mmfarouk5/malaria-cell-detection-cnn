@@ -1,5 +1,4 @@
 # Training configuration
-
 model:
   freeze_backbone: True
   num_classes: 1
@@ -9,9 +8,14 @@ training:
   batch_size: 32
   learning_rate: 0.0001
   weight_decay: 0.0001
-  early_stopping_patience: 5
   max_norm: 1.0
+  random_seed: 42
+  early_stopping_patience: 5
+  scheduler_factor: 0.5
+  scheduler_patience: 3
+  resume_training: False
 
 paths:
-  save_dir: "./outputs/models/resnet50_finetuned.pth"
-  log_dir: "./outputs/logs"
+  save_dir: "../outputs/models/resnet50_finetuned.pth"
+  checkpoint_dir: "../outputs/models/checkpoint.pth"
+  log_dir: "../outputs/logs"
