@@ -152,7 +152,6 @@ def main():
     cfg = load_config()
     logger.info("Loaded configuration.")
 
-    # Set random seed
     set_seed(cfg["training"]["random_seed"])
     logger.info(f"Random seed set to {cfg['training']['random_seed']}")
 
@@ -189,7 +188,7 @@ def main():
     epochs = cfg["training"]["epochs"]
     max_norm = cfg["training"]["max_norm"]
     early_stopping_patience = cfg["training"]["early_stopping_patience"]
-    resume_training = cfg["training"].get("resume_training", False)
+    resume_training = cfg["training"]["resume_training"]
 
     # Resume from checkpoint if enabled
     start_epoch = 0
