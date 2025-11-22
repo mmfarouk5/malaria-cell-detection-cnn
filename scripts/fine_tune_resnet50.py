@@ -9,289 +9,332 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.tensorboard import SummaryWriter
+from torch.cuda.amp import autocast, GradScaler
 from data import train_loader, val_loader
 
-if torch.cuda.is_available():
-	device = torch.device("cuda")
-elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-	device = torch.device("mps")
-else:
-	device = torch.device("cpu")
+def get_device():
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    else:
+        return torch.device("cpu")
 
 
-def set_seed(seed):
-	torch.manual_seed(seed)
-	torch.cuda.manual_seed_all(seed)
-	torch.backends.cudnn.deterministic = True
-	torch.backends.cudnn.benchmark = False
-	import numpy as np
-	import random
-	np.random.seed(seed)
-	random.seed(seed)
+device = get_device()
+
+
+def set_seed(seed: int):
+    import random
+    import numpy as np
+
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+    np.random.seed(seed)
+    random.seed(seed)
 
 
 def setup_logger():
-	logging.basicConfig(
-		level=logging.INFO,
-		format="[%(asctime)s] %(levelname)s: %(message)s",
-		datefmt="%Y-%m-%d %H:%M:%S"
-	)
-	return logging.getLogger(__name__)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="[%(asctime)s] %(levelname)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    return logging.getLogger(__name__)
 
 
 logger = setup_logger()
 
 
-def load_config(path=None):
-	if path is None:
-		path = os.path.join(os.path.dirname(__file__), "..", "config.yaml")
+def load_config(path: str = None):
+    if path is None:
+        path = os.path.join(os.path.dirname(__file__), "configs", "fine_tune_resnet50.yaml")
 
-	try:
-		with open(path, "r") as f:
-			config = yaml.safe_load(f)
-			logger.info(f"Configuration loaded from {path}")
-			return config
-	except FileNotFoundError:
-		logger.error(f"Configuration file not found: {path}")
-		raise
-	except yaml.YAMLError as e:
-		logger.error(f"Error parsing YAML configuration: {e}")
-		raise
+    if not os.path.exists(path):
+        logger.error(f"Configuration file not found: {path}")
+        raise FileNotFoundError(path)
+
+    try:
+        with open(path, "r") as f:
+            cfg = yaml.safe_load(f)
+            logger.info(f"Configuration loaded from {path}")
+            
+            # Add basic validation
+            required_keys = ["training", "model", "paths"]
+            for key in required_keys:
+                if key not in cfg:
+                    raise ValueError(f"Missing required config key: {key}")
+            
+            return cfg
+    except yaml.YAMLError as e:
+        logger.error(f"Error parsing YAML configuration: {e}")
+        raise
 
 
 def build_resnet50(num_classes=1, freeze_backbone=False):
-	try:
-		model = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
+    try:
+        model = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
 
-		if freeze_backbone:
-			for param in model.parameters():
-				param.requires_grad = False
+        if freeze_backbone:
+            for param in model.parameters():
+                param.requires_grad = False
 
-		in_features = model.fc.in_features
-		model.fc = nn.Linear(in_features, num_classes)
+        in_features = model.fc.in_features
+        model.fc = nn.Linear(in_features, num_classes)
 
-		logger.info(f"ResNet50 built with {num_classes} output classes")
-		return model
-	except Exception as e:
-		logger.error(f"Error building model: {e}")
-		raise
-
-
-def train_one_epoch(model, loader, criterion, optimizer, max_norm):
-	if len(loader) == 0:
-		logger.warning("Empty training dataloader!")
-		return 0.0, 0.0
-
-	model.train()
-	total_loss = 0
-	correct = 0
-	total = 0
-
-	for imgs, labels in tqdm(loader, desc="Training"):
-		imgs = imgs.to(device)
-		labels = labels.float().to(device)
-
-		try:
-			optimizer.zero_grad()
-			outputs = model(imgs).squeeze(1)
-
-			loss = criterion(outputs, labels)
-			loss.backward()
-
-			clip_grad_norm_(model.parameters(), max_norm=max_norm)
-
-			optimizer.step()
-
-			total_loss += loss.item()
-
-			preds = (torch.sigmoid(outputs) > 0.5).float()
-			correct += (preds == labels).sum().item()
-			total += labels.size(0)
-
-		except RuntimeError as e:
-			logger.error(f"Training error: {e}")
-			continue
-
-	accuracy = correct / total if total > 0 else 0
-	return total_loss / len(loader), accuracy
+        logger.info(f"ResNet50 built with {num_classes} output classes; freeze_backbone={freeze_backbone}")
+        return model
+    except Exception as e:
+        logger.error(f"Error building model: {e}")
+        raise
 
 
-def validate(model, loader, criterion):
-	if len(loader) == 0:
-		logger.warning("Empty validation dataloader!")
-		return 0.0, 0.0
+def save_checkpoint(full_path, epoch, model, optimizer, scheduler, best_val_loss, scaler=None):
+    try:
+        checkpoint = {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
+            "best_val_loss": best_val_loss
+        }
+        if scaler is not None:
+            checkpoint["scaler_state_dict"] = scaler.state_dict()
 
-	model.eval()
-	val_loss = 0
-	correct = 0
-	total = 0
-
-	with torch.no_grad():
-		for imgs, labels in tqdm(loader, desc="Validation"):
-			imgs = imgs.to(device)
-			labels = labels.float().to(device)
-
-			outputs = model(imgs).squeeze(1)
-			loss = criterion(outputs, labels)
-
-			val_loss += loss.item()
-
-			preds = (torch.sigmoid(outputs) > 0.5).float()
-			correct += (preds == labels).sum().item()
-			total += labels.size(0)
-
-	accuracy = correct / total if total > 0 else 0
-	return val_loss / len(loader), accuracy
+        torch.save(checkpoint, full_path)
+        logger.info(f"Checkpoint saved: {full_path}")
+    except Exception as e:
+        logger.error(f"Error saving checkpoint to {full_path}: {e}")
 
 
-def save_checkpoint(model, optimizer, scheduler, epoch, best_val_loss, path):
-	try:
-		checkpoint = {
-			'epoch': epoch,
-			'model_state_dict': model.state_dict(),
-			'optimizer_state_dict': optimizer.state_dict(),
-			'scheduler_state_dict': scheduler.state_dict(),
-			'best_val_loss': best_val_loss
-		}
-		torch.save(checkpoint, path)
-		logger.info(f"Checkpoint saved at epoch {epoch}")
-	except Exception as e:
-		logger.error(f"Error saving checkpoint: {e}")
+def try_load_checkpoint(path, model, optimizer, scheduler, scaler=None):
+    if not path or not os.path.exists(path):
+        logger.info("No checkpoint found. Starting from scratch.")
+        return 0, float("inf")
+
+    try:
+        ckpt = torch.load(path, map_location=device)
+
+        required = ["model_state_dict", "optimizer_state_dict", "epoch", "best_val_loss"]
+        if not all(k in ckpt for k in required):
+            logger.error("Checkpoint missing required keys. Ignoring.")
+            return 0, float("inf")
+
+        model.load_state_dict(ckpt["model_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+
+        # Move tensors to device BEFORE loading scheduler
+        for state in optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(device)
+
+        if scheduler is not None and ckpt.get("scheduler_state_dict") is not None:
+            try:
+                scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+            except Exception as e:
+                logger.warning(f"Couldn't load scheduler state: {e}")
 
 
-def load_checkpoint(model, optimizer, scheduler, path):
-	if not os.path.exists(path):
-		logger.info("No checkpoint found. Starting from scratch.")
-		return 0, float('inf')
+        if scaler is not None and ckpt.get("scaler_state_dict") is not None:
+            try:
+                scaler.load_state_dict(ckpt["scaler_state_dict"])
+            except Exception as e:
+                logger.warning(f"Couldn't load scaler state: {e}")
 
-	try:
-		checkpoint = torch.load(path, map_location=device, weights_only=False)
+        epoch = ckpt["epoch"]
+        best_val_loss = ckpt["best_val_loss"]
+        logger.info(f"Resumed from checkpoint {path} at epoch {epoch} with best_val_loss={best_val_loss:.4f}")
+        return epoch, best_val_loss
 
-		required_keys = ['model_state_dict', 'optimizer_state_dict',
-		                 'scheduler_state_dict', 'epoch', 'best_val_loss']
-		if not all(key in checkpoint for key in required_keys):
-			logger.error("Invalid checkpoint file - missing required keys")
-			return 0, float('inf')
+    except Exception as e:
+        logger.error(f"Error loading checkpoint {path}: {e}")
+        return 0, float("inf")
 
-		model.load_state_dict(checkpoint['model_state_dict'])
-		optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-		scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
 
-		for state in optimizer.state.values():
-			for k, v in state.items():
-				if isinstance(v, torch.Tensor):
-					state[k] = v.to(device)
+def train_one_epoch(model, loader, criterion, optimizer, scaler, max_norm, threshold, amp_enabled):
+    model.train()
+    total_loss = 0.0
+    correct = 0
+    total = 0
 
-		epoch = checkpoint['epoch']
-		best_val_loss = checkpoint['best_val_loss']
+    for imgs, labels in tqdm(loader, desc="Training", leave=True):
+        imgs = imgs.to(device)
+        labels = labels.float().to(device)
 
-		logger.info(f"Resumed from epoch {epoch} with best val loss: {best_val_loss:.4f}")
-		return epoch, best_val_loss
+        optimizer.zero_grad()
 
-	except Exception as e:
-		logger.error(f"Error loading checkpoint: {e}")
-		return 0, float('inf')
+        with autocast(enabled=amp_enabled):
+            outputs = model(imgs).squeeze(1)
+            loss = criterion(outputs, labels)
+
+        if amp_enabled:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            clip_grad_norm_(model.parameters(), max_norm=max_norm)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            clip_grad_norm_(model.parameters(), max_norm=max_norm)
+            optimizer.step()
+
+        total_loss += loss.item()
+
+        with torch.no_grad():
+            preds = (torch.sigmoid(outputs) > threshold).float()
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
+
+    accuracy = correct / total if total > 0 else 0.0
+    avg_loss = total_loss / len(loader)
+    return avg_loss, accuracy
+
+
+def validate(model, loader, criterion, threshold, amp_enabled):
+    model.eval()
+    val_loss = 0.0
+    correct = 0
+    total = 0
+
+    with torch.no_grad():
+        for imgs, labels in tqdm(loader, desc="Validation", leave=True):
+            imgs = imgs.to(device)
+            labels = labels.float().to(device)
+
+            with autocast(enabled=amp_enabled):
+                outputs = model(imgs).squeeze(1)
+                loss = criterion(outputs, labels)
+
+            val_loss += loss.item()
+            preds = (torch.sigmoid(outputs) > threshold).float()
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
+
+    accuracy = correct / total if total > 0 else 0.0
+    avg_loss = val_loss / len(loader)
+    return avg_loss, accuracy
 
 
 def main():
-	try:
-		cfg = load_config()
-		logger.info(f"Device: {device}")
+    writer = None
+    try:
+        cfg = load_config()
+        logger.info(f"Device: {device}")
 
-		set_seed(cfg["training"]["random_seed"])
-		logger.info(f"Random seed set to {cfg['training']['random_seed']}")
+        if len(train_loader) == 0:
+            raise ValueError("Training dataloader is empty!")
+        if len(val_loader) == 0:
+            raise ValueError("Validation dataloader is empty!")
+        logger.info(f"Data loaders validated: {len(train_loader)} train batches, {len(val_loader)} val batches")
 
-		writer = SummaryWriter(log_dir=cfg["paths"]["log_dir"])
-		logger.info("TensorBoard writer initialized.")
+        set_seed(cfg["training"].get("random_seed", 42))
+        logger.info(f"Random seed set to {cfg['training'].get('random_seed', 42)}")
 
-		model = build_resnet50(
-			num_classes=cfg["model"]["num_classes"],
-			freeze_backbone=cfg["model"]["freeze_backbone"]
-		).to(device)
+        writer = SummaryWriter(log_dir=cfg["paths"]["log_dir"])
+        logger.info(f"TensorBoard writer initialized at {cfg['paths']['log_dir']}")
 
-		criterion = nn.BCEWithLogitsLoss()
+        model = build_resnet50(
+            num_classes=cfg["model"].get("num_classes", 1),
+            freeze_backbone=cfg["model"].get("freeze_backbone", False)
+        ).to(device)
 
-		optimizer = AdamW(
-			filter(lambda p: p.requires_grad, model.parameters()),
-			lr=cfg["training"]["learning_rate"],
-			weight_decay=cfg["training"]["weight_decay"]
-		)
+        criterion = nn.BCEWithLogitsLoss()
 
-		scheduler = ReduceLROnPlateau(
-			optimizer,
-			mode='min',
-			factor=cfg["training"]["scheduler_factor"],
-			patience=cfg["training"]["scheduler_patience"],
-			verbose=True
-		)
+        optimizer = AdamW(
+            filter(lambda p: p.requires_grad, model.parameters()),
+            lr=cfg["training"].get("learning_rate", 1e-4),
+            weight_decay=cfg["training"].get("weight_decay", 1e-4)
+        )
 
-		save_path = cfg["paths"]["save_dir"]
-		checkpoint_path = cfg["paths"]["checkpoint_dir"]
-		os.makedirs(os.path.dirname(save_path), exist_ok=True)
-		os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+        scheduler = ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=cfg["training"].get("scheduler_factor", 0.5),
+            patience=cfg["training"].get("scheduler_patience", 3),
+            verbose=True
+        )
 
-		epochs = cfg["training"]["epochs"]
-		max_norm = cfg["training"]["max_norm"]
-		early_stopping_patience = cfg["training"]["early_stopping_patience"]
-		resume_training = cfg["training"]["resume_training"]
+        amp_enabled = cfg.get("amp", {}).get("enabled", True)
+        scaler = GradScaler(enabled=amp_enabled)
+        logger.info(f"AMP enabled: {amp_enabled}")
 
-		start_epoch = 0
-		best_val_loss = float('inf')
-		if resume_training:
-			start_epoch, best_val_loss = load_checkpoint(model, optimizer, scheduler, checkpoint_path)
+        save_path = cfg["paths"]["save_dir"]
+        checkpoint_main = cfg["paths"]["checkpoint_dir"]
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        os.makedirs(os.path.dirname(checkpoint_main), exist_ok=True)
 
-			if start_epoch > 0:
-				logger.info("Validating loaded checkpoint...")
-				val_loss, val_acc = validate(model, val_loader, criterion)
-				logger.info(f"Checkpoint validation - Loss: {val_loss:.4f}, Acc: {val_acc:.4f}")
+        epochs = cfg["training"].get("epochs", 12)
+        max_norm = cfg["training"].get("max_norm", 1.0)
+        threshold = cfg["training"].get("threshold", 0.5)
+        early_stopping_patience = cfg["training"].get("early_stopping_patience", 5)
+        resume_training = cfg["training"].get("resume_training", False)
 
-		patience_counter = 0
+        start_epoch = 0
+        best_val_loss = float("inf")
 
-		logger.info(f"Starting training for {epochs} epochs...")
+        if resume_training:
+            start_epoch, best_val_loss = try_load_checkpoint(checkpoint_main, model, optimizer, scheduler, scaler)
+            if start_epoch > 0:
+                logger.info("Performing quick validation check of loaded checkpoint...")
+                val_loss, val_acc = validate(model, val_loader, criterion, threshold, amp_enabled)
+                logger.info(f"Checkpoint validation - Loss: {val_loss:.4f}, Acc: {val_acc:.4f}")
 
-		for epoch in range(start_epoch + 1, epochs + 1):
-			train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, max_norm=max_norm)
-			val_loss, val_acc = validate(model, val_loader, criterion)
+        patience_counter = 0
+        logger.info(f"Starting training for {epochs} epochs (from epoch {start_epoch + 1})...")
 
-			scheduler.step(val_loss)
-			current_lr = optimizer.param_groups[0]['lr']
+        for epoch in range(start_epoch + 1, epochs + 1):
+            train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, scaler, max_norm, threshold, amp_enabled)
+            val_loss, val_acc = validate(model, val_loader, criterion, threshold, amp_enabled)
 
-			logger.info(
-				f"Epoch {epoch}/{epochs} | "
-				f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | "
-				f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f} | "
-				f"LR: {current_lr:.6f}"
-			)
+            scheduler.step(val_loss)
+            current_lr = optimizer.param_groups[0]["lr"]
 
-			writer.add_scalar("Loss/Train", train_loss, epoch)
-			writer.add_scalar("Loss/Validation", val_loss, epoch)
-			writer.add_scalar("Accuracy/Train", train_acc, epoch)
-			writer.add_scalar("Accuracy/Validation", val_acc, epoch)
-			writer.add_scalar("Learning_Rate", current_lr, epoch)
+            logger.info(
+                f"Epoch {epoch}/{epochs} | "
+                f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | "
+                f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f} | "
+                f"LR: {current_lr:.6f}"
+            )
 
-			if val_loss < best_val_loss:
-				best_val_loss = val_loss
-				patience_counter = 0
-				torch.save(model.state_dict(), save_path)
-				logger.info(f"Best model saved at epoch {epoch} with val_loss: {val_loss:.4f}")
-			else:
-				patience_counter += 1
-				logger.info(f"No improvement. Patience: {patience_counter}/{early_stopping_patience}")
+            writer.add_scalar("Loss/Train", train_loss, epoch)
+            writer.add_scalar("Loss/Validation", val_loss, epoch)
+            writer.add_scalar("Accuracy/Train", train_acc, epoch)
+            writer.add_scalar("Accuracy/Validation", val_acc, epoch)
+            writer.add_scalar("Learning_Rate", current_lr, epoch)
 
-			save_checkpoint(model, optimizer, scheduler, epoch, best_val_loss, checkpoint_path)
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                patience_counter = 0
+                torch.save(model.state_dict(), save_path)
+                logger.info(f"Best model saved at epoch {epoch} with val_loss: {val_loss:.4f}")
+            else:
+                patience_counter += 1
+                logger.info(f"No improvement. Patience: {patience_counter}/{early_stopping_patience}")
 
-			if patience_counter >= early_stopping_patience:
-				logger.info(f"Early stopping triggered after {epoch} epochs")
-				break
+            save_checkpoint(checkpoint_main, epoch, model, optimizer, scheduler, best_val_loss, scaler=scaler)
 
-		logger.info(f"Training complete. Best validation loss: {best_val_loss:.4f}")
+            if patience_counter >= early_stopping_patience:
+                logger.info(f"Early stopping triggered after epoch {epoch}")
+                break
 
-		writer.close()
+        logger.info(f"Training finished. Best validation loss: {best_val_loss:.4f}")
 
-	except Exception as e:
-		logger.error(f"Training failed: {e}")
-		raise
+        writer.close()
+
+    except Exception as e:
+        logger.error(f"Training failed: {e}")
+        raise
+    finally:
+        if writer is not None:
+            writer.close()
+            logger.info("TensorBoard writer closed")
 
 
 if __name__ == "__main__":
-	main()
+    main()
