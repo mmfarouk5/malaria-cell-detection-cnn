@@ -16,7 +16,7 @@ training:
   resume_training: False
 
 amp:
-  enabled: False
+  enabled: True
 
 checkpoint_avg:
   enabled: True
