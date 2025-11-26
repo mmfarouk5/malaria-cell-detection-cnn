@@ -75,16 +75,16 @@ malaria-cell-detection-dl/
 │   ├── test_baseline_model.py       # Baseline model evaluation
 │   └── fine_tune_resnet50.py        # ResNet50 transfer learning
 ├── outputs/
-│   ├── models/                      # Saved model weights
-│   │   ├── baseline_model.pth
-│   │   ├── resnet50_finetuned.pth
-│   │   └── checkpoint.pth
-│   ├── figures/                     # Evaluation plots
-│   │   ├── confusion_matrix.png
-│   │   └── roc_curve.png
-│   ├── logs/                        # TensorBoard logs
-│   └── screenshots/                 # Training progress screenshots
-└── team_info/                       # Team documentation
+    ├── models/                      # Saved model weights
+    │   ├── baseline_model.pth
+    │   ├── resnet50_finetuned.pth
+    │   └── checkpoint.pth
+    ├── figures/                     # Evaluation plots
+    │   ├── confusion_matrix.png
+    │   └── roc_curve.png
+    ├── logs/                        # TensorBoard logs
+    └── screenshots/                 # Training progress screenshots
+
 ```
 
 ## 🤖 Models
@@ -283,9 +283,6 @@ training:
 amp:
   enabled: False                 # Use mixed precision training
 
-checkpoint_avg:
-  enabled: True                  # Average top-k checkpoints
-  top_k: 3                       # Number of best models to average
 ```
 
 ## 🔧 Technologies Used
@@ -331,7 +328,3 @@ The project uses comprehensive metrics:
 ## 📝 License
 
 This project is for educational purposes.
-
----
-
-**Last Updated:** November 23, 2025
