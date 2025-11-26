@@ -195,7 +195,7 @@ Advanced Features:
 1. **Clone the repository:**
 ```bash
 git clone <repository-url>
-cd malaria-cell-detection-dl
+cd malaria-cell-detection-cnn
 ```
 
 2. **Create a virtual environment (optional but recommended):**
